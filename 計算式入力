@@ -1,0 +1,335 @@
+Option Explicit
+
+' ==============================================================================
+' 定数定義
+' ==============================================================================
+Private Const TARGET_FOLDER_NAME As String = "変換完了"
+Private Const HEADER_ROW As Long = 3
+Private Const DATA_START_ROW As Long = 4
+Private Const LINK_SHEET_NAME As String = "別紙リンク付" ' 作業用シート名
+
+' ==============================================================================
+' メイン処理
+' ==============================================================================
+Sub FormatAndCalculateAllFilesInFolder()
+    Dim fso As Object
+    Dim targetPath As String
+    Dim fileName As String
+    Dim wb As Workbook
+    Dim processedCount As Long
+
+    ' 高速化設定
+    With Application
+        .ScreenUpdating = False
+        .Calculation = xlCalculationManual
+        .DisplayAlerts = False
+        .EnableEvents = False
+    End With
+
+    targetPath = ThisWorkbook.Path & "\" & TARGET_FOLDER_NAME & "\"
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not fso.FolderExists(targetPath) Then
+        MsgBox "対象フォルダが見つかりません：" & vbCrLf & targetPath, vbExclamation
+        GoTo Cleanup
+    End If
+
+    fileName = Dir(targetPath & "*.xls*")
+    processedCount = 0
+
+    Do While fileName <> ""
+        If fileName <> ThisWorkbook.Name And Left(fileName, 2) <> "~$" Then
+            On Error Resume Next
+            Set wb = Workbooks.Open(targetPath & fileName)
+            
+            If Err.Number = 0 Then
+                ' 1. シートごとの個別処理（書式・計算式）
+                Call ProcessWorkbook(wb)
+                
+                ' 2. 【改修】管理シートを用いたリンク処理
+                Call ProcessLinkWithSheet(wb)
+                
+                wb.Close SaveChanges:=True
+                processedCount = processedCount + 1
+            Else
+                Err.Clear
+            End If
+            On Error GoTo 0
+        End If
+        fileName = Dir()
+    Loop
+
+Cleanup:
+    With Application
+        .ScreenUpdating = True
+        .Calculation = xlCalculationAutomatic
+        .DisplayAlerts = True
+        .EnableEvents = True
+    End With
+
+    MsgBox "処理が完了しました。" & vbCrLf & "処理ファイル数: " & processedCount & " 件", vbInformation
+    Set fso = Nothing
+    Set wb = Nothing
+End Sub
+
+' ==============================================================================
+' 個別処理: シートごとの判定ロジック (変更なし)
+' ==============================================================================
+Sub ProcessWorkbook(wb As Workbook)
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim titleCell As String
+
+    For Each ws In wb.Worksheets
+        ' 作業用シートはスキップ
+        If ws.Name = LINK_SHEET_NAME Then GoTo NextSheet
+
+        lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        If lastRow < DATA_START_ROW Then GoTo NextSheet
+        
+        ' タイトルによる判定
+        titleCell = ws.Range("A1").Value
+        
+        ' 1. 「別紙明細」が含まれる場合は専用ロジックへ
+        If InStr(titleCell, "別紙明細") > 0 Then
+            Call ProcessSpecialDetail(ws, DATA_START_ROW, lastRow)
+            GoTo NextSheet
+        End If
+
+        ' 2. 既存の列数判定ロジック
+        lastCol = ws.Cells(HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+        
+        Select Case lastCol
+            Case 5 ' パターンA
+                Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+            Case 6 ' パターンB
+                Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+            Case 7 ' パターンC
+                Call SetColumnFormat(ws, "C", DATA_START_ROW, lastRow)
+                Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+                Call SetColumnFormat(ws, "F", DATA_START_ROW, lastRow)
+                Call InsertCalculations_PatternC(ws, DATA_START_ROW, lastRow)
+        End Select
+
+NextSheet:
+    Next ws
+End Sub
+
+' ==============================================================================
+' 【新規】作業用シートを用いたリンク処理ロジック
+' ==============================================================================
+Sub ProcessLinkWithSheet(wb As Workbook)
+    Dim wsMap As Worksheet
+    Dim ws As Worksheet
+    Dim r As Long, lastRow As Long
+    Dim mapRow As Long
+    Dim colAmount As Long, colRemarks As Long
+    Dim valID As String
+    Dim dictOrder As Object
+    
+    ' 登場回数カウント用辞書 (Key: 別紙ID, Item: 回数)
+    Set dictOrder = CreateObject("Scripting.Dictionary")
+    
+    ' 1. 作業用シート「別紙リンク付」の作成（既存ならクリア）
+    On Error Resume Next
+    Set wsMap = wb.Worksheets(LINK_SHEET_NAME)
+    On Error GoTo 0
+    
+    If wsMap Is Nothing Then
+        Set wsMap = wb.Worksheets.Add(Before:=wb.Worksheets(1))
+        wsMap.Name = LINK_SHEET_NAME
+    Else
+        wsMap.Cells.Clear
+    End If
+    
+    ' ヘッダー作成
+    wsMap.Range("A1:E1").Value = Array("別紙ID", "登場順序", "金額セル番地", "G1値(シート名)", "実シート名")
+    mapRow = 2
+    
+    ' 2. 全シートを走査してリストを作成（積み上げ）
+    For Each ws In wb.Worksheets
+        If ws.Name = LINK_SHEET_NAME Then GoTo ContinueLoop
+        
+        lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+        If lastRow < DATA_START_ROW Then GoTo ContinueLoop
+        
+        ' ヘッダー行から「金額」「備考」の列番号を取得
+        colAmount = GetColumnByHeader(ws, HEADER_ROW, "金額")
+        colRemarks = GetColumnByHeader(ws, HEADER_ROW, "備考")
+        
+        ' 列が見つからない場合はスキップ
+        If colAmount = 0 Or colRemarks = 0 Then GoTo ContinueLoop
+        
+        ' データ行を走査
+        For r = DATA_START_ROW To lastRow
+            valID = ws.Cells(r, colRemarks).Value
+            
+            ' 備考に「別紙」が含まれる場合
+            If InStr(valID, "別紙") > 0 Then
+                ' 登場回数を更新
+                If Not dictOrder.Exists(valID) Then
+                    dictOrder(valID) = 1
+                Else
+                    dictOrder(valID) = dictOrder(valID) + 1
+                End If
+                
+                ' 管理シートに行を追加
+                ' A列: 別紙ID
+                ' B列: 登場順序
+                ' C列: 金額列のセル番地 (Addressプロパティで取得、例:$F$4)
+                ' D列: シートG1の値
+                ' E列: 実際のExcelシート名（後で書き込み用）
+                wsMap.Cells(mapRow, 1).Value = valID
+                wsMap.Cells(mapRow, 2).Value = dictOrder(valID)
+                wsMap.Cells(mapRow, 3).Value = ws.Cells(r, colAmount).Address(False, False)
+                wsMap.Cells(mapRow, 4).Value = ws.Range("G1").Value
+                wsMap.Cells(mapRow, 5).Value = ws.Name
+                
+                mapRow = mapRow + 1
+            End If
+        Next r
+        
+ContinueLoop:
+    Next ws
+    
+    ' 3. リストを元にリンク式を作成
+    ' B列(順序)が 2 の行を探し、対応する 1 の行に式を入れる
+    Dim i As Long
+    Dim j As Long
+    Dim targetID As String
+    Dim sourceSheetG1 As String
+    Dim sourceAddress As String
+    Dim targetWsName As String
+    Dim targetAddress As String
+    
+    lastRow = wsMap.Cells(wsMap.Rows.Count, "A").End(xlUp).Row
+    
+    ' リスト全行をループ (Source探し)
+    For i = 2 To lastRow
+        ' 登場順序が 2 の行 = 情報源(Source)
+        If wsMap.Cells(i, 2).Value = 2 Then
+            targetID = wsMap.Cells(i, 1).Value
+            sourceSheetG1 = wsMap.Cells(i, 4).Value
+            sourceAddress = wsMap.Cells(i, 3).Value
+            
+            ' 対応する順序 1 の行を探す (Target探し)
+            For j = 2 To lastRow
+                If wsMap.Cells(j, 1).Value = targetID And wsMap.Cells(j, 2).Value = 1 Then
+                    targetWsName = wsMap.Cells(j, 5).Value
+                    targetAddress = wsMap.Cells(j, 3).Value
+                    
+                    ' 転記先シートに数式を入力
+                    ' 式: ='[Source G1]'![Source Address]
+                    wb.Worksheets(targetWsName).Range(targetAddress).Formula = _
+                        "='" & sourceSheetG1 & "'!" & sourceAddress
+                    
+                    Exit For ' 見つかったら内側ループを抜ける
+                End If
+            Next j
+        End If
+    Next i
+    
+    ' 4. 作業用シートの削除
+    Application.DisplayAlerts = False
+    wsMap.Delete
+    Application.DisplayAlerts = False ' メイン処理側で制御されているが念の為
+    
+    Set dictOrder = Nothing
+    Set wsMap = Nothing
+End Sub
+
+' ==============================================================================
+' 汎用関数: ヘッダー名から列番号を取得
+' 見つからない場合は0を返す
+' ==============================================================================
+Function GetColumnByHeader(ws As Worksheet, hRow As Long, headerName As String) As Long
+    Dim foundCell As Range
+    ' ヘッダー行全体から検索
+    Set foundCell = ws.Rows(hRow).Find(What:=headerName, LookAt:=xlPart, MatchByte:=False)
+    
+    If Not foundCell Is Nothing Then
+        GetColumnByHeader = foundCell.Column
+    Else
+        GetColumnByHeader = 0
+    End If
+End Function
+
+' ==============================================================================
+' 「別紙明細」用計算ロジック (変更なし)
+' ==============================================================================
+Private Sub ProcessSpecialDetail(ws As Worksheet, startRow As Long, endRow As Long)
+    Dim i As Long
+    Dim parentRow As Long
+    Dim cellValA As String
+    Dim cellValD As String
+    
+    Call SetColumnFormat(ws, "C", startRow, endRow)
+    Call SetColumnFormat(ws, "E", startRow, endRow)
+    Call SetColumnFormat(ws, "F", startRow, endRow)
+    
+    parentRow = 0
+
+    For i = startRow To endRow
+        cellValA = ws.Cells(i, "A").Value
+        cellValD = ws.Cells(i, "D").Value
+        
+        If InStr(cellValA, "計") > 0 Then
+            If parentRow > 0 Then
+                If i > parentRow + 1 Then
+                    ws.Cells(i, "F").Formula = "=SUM(F" & (parentRow + 1) & ":F" & (i - 1) & ")"
+                Else
+                     ws.Cells(i, "F").Value = 0
+                End If
+                ws.Cells(parentRow, "F").Formula = "=F" & i
+                parentRow = 0
+            End If
+            
+        ElseIf cellValD = "式" Then
+            parentRow = i
+            
+        ElseIf cellValD <> "" Then
+            ws.Cells(i, "F").Formula = "=C" & i & "*E" & i
+            
+        End If
+    Next i
+End Sub
+
+' ==============================================================================
+' 共通処理: 指定列の書式設定 (変更なし)
+' ==============================================================================
+Private Sub SetColumnFormat(ws As Worksheet, colName As String, startRow As Long, endRow As Long)
+    With ws.Range(colName & startRow & ":" & colName & endRow)
+        .HorizontalAlignment = xlRight
+        .VerticalAlignment = xlBottom
+        .WrapText = False
+        .IndentLevel = 0
+    End With
+End Sub
+
+' ==============================================================================
+' パターンC用: 従来の計算式挿入ロジック (変更なし)
+' ==============================================================================
+Private Sub InsertCalculations_PatternC(ws As Worksheet, startRow As Long, endRow As Long)
+    Dim i As Long
+    Dim currentSumStartRow As Long
+    Dim cellValA As String
+    Dim cellValD As String
+
+    currentSumStartRow = startRow
+
+    For i = startRow To endRow
+        cellValA = ws.Cells(i, "A").Value
+        cellValD = ws.Cells(i, "D").Value
+        
+        If InStr(cellValA, "計") > 0 Then
+            If i > currentSumStartRow Then
+                ws.Cells(i, "F").Formula = "=SUM(F" & currentSumStartRow & ":F" & (i - 1) & ")"
+            End If
+            currentSumStartRow = i + 1
+        ElseIf cellValD <> "" Then
+            ws.Cells(i, "F").Formula = "=C" & i & "*E" & i
+        End If
+    Next i
+End Sub
+

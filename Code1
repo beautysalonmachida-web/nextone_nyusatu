@@ -1,187 +1,900 @@
+'--- 標準モジュール (モジュール名: クエリ簡易整形v8) ---
 Option Explicit
 
-' ==============================================================================
-' 定数定義（メンテナンスしやすいように値をここで管理）
-' ==============================================================================
-Private Const TARGET_FOLDER_NAME As String = "変換完了" ' 処理対象フォルダ名
-Private Const HEADER_ROW As Long = 3                    ' ヘッダー行番号
-Private Const DATA_START_ROW As Long = 4                ' データ開始行番号
+' 定数定義
+Private Const KEYWORD_START As String = "工事費内訳"   ' 処理開始のトリガー
+Private Const FOLDER_NAME_SRC As String = "参考数量書PDF_変換前"
+Private Const FOLDER_NAME_DST As String = "参考数量書PDF_変換後"
 
-' ==============================================================================
-' メイン処理: フォルダ内の全ファイルを巡回
-' ==============================================================================
-Sub FormatAndCalculateAllFilesInFolder()
-Dim fso As Object
-Dim targetPath As String
-Dim fileName As String
-Dim wb As Workbook
-Dim processedCount As Long
+' -------------------------------------------------------------------------
+' エントリーポイント (マクロ実行名: SimpleQueryConversion8)
+' -------------------------------------------------------------------------
+Sub SimpleQueryConversion8()
+    Dim resp As VbMsgBoxResult
+    Dim targetSheetName As String
+    Dim ws As Worksheet
+    Dim found As Boolean
 
-' 画面更新・自動計算等の停止（高速化）
-With Application
-    .ScreenUpdating = False
-    .Calculation = xlCalculationManual
-    .DisplayAlerts = False
-    .EnableEvents = False
-End With
+    found = False
+    targetSheetName = ""
 
-' 対象フォルダパスの構築
-' マクロブックと同じ親フォルダ内の「変換完了」フォルダ
-targetPath = ThisWorkbook.Path & "\" & TARGET_FOLDER_NAME & "\"
+    ' ---------------------------------------------------------
+    ' 対象シートの自動判定
+    ' ---------------------------------------------------------
 
-' フォルダの存在確認
-Set fso = CreateObject("Scripting.FileSystemObject")
-If Not fso.FolderExists(targetPath) Then
-    MsgBox "対象フォルダが見つかりません：" & vbCrLf & targetPath, vbExclamation
-    GoTo Cleanup
-End If
+    ' 優先1: 指定のシート名を探す
+    On Error Resume Next
+    Set ws = ActiveWorkbook.Sheets("参考数量書PDF_変換前")
+    On Error GoTo 0
 
-' フォルダ内の最初のファイル名を取得
-fileName = Dir(targetPath & "*.xls*")
+    If Not ws Is Nothing Then
+        targetSheetName = ws.Name
+        found = True
+    Else
+        ' 優先2: 除外シート以外を探す
+        For Each ws In ActiveWorkbook.Sheets
+            Select Case ws.Name
+                ' 除外リスト
+                Case "buttom", "5列header", "6列header", "7列header"
+                    ' スキップ
+                Case Else
+                    targetSheetName = ws.Name
+                    found = True
+                    Exit For
+            End Select
+        Next ws
+    End If
 
-processedCount = 0
+    ' 見つからなかった場合
+    If Not found Then
+        MsgBox "処理対象となるシートが見つかりませんでした。" & vbCrLf & _
+               "('参考数量書PDF_変換前' または 除外リスト以外のシート)", vbExclamation
+        Exit Sub
+    End If
 
-' ファイル巡回処理
-Do While fileName <> ""
-    ' 除外条件: マクロブック自身、一時ファイル(~$で始まる)
-    If fileName <> ThisWorkbook.Name And Left(fileName, 2) <> "~$" Then
-        
-        ' エラーがあっても次のファイルへ進む
-        On Error Resume Next
-        Set wb = Workbooks.Open(targetPath & fileName)
-        
-        If Err.Number = 0 Then
-            ' 個別処理の実行
-            Call ProcessWorkbook(wb)
-            
-            ' 保存して閉じる
-            wb.Close SaveChanges:=True
-            processedCount = processedCount + 1
+    ' ---------------------------------------------------------
+    ' 実行確認
+    ' ---------------------------------------------------------
+    resp = MsgBox("対象シート: '" & targetSheetName & "' を変換元として処理を実行しますか？" & vbCrLf & vbCrLf & _
+                  "・A列(Source.Name)ごとにシートを分割します" & vbCrLf & _
+                  "・C列(Data.Column1)以降をデータとして扱います" & vbCrLf & _
+                  "・完了後、'" & FOLDER_NAME_SRC & "' 内のファイルを" & vbCrLf & _
+                  "　'" & FOLDER_NAME_DST & "' へ移動します" & vbCrLf & vbCrLf & _
+                  "[v8: タイトル・ヘッダー間の行を特別処理]", _
+                  vbYesNo + vbQuestion, "実行確認")
+
+    If resp = vbYes Then
+        Call ConvertPDFQueryData(targetSheetName)
+    End If
+End Sub
+
+' -------------------------------------------------------------------------
+' メイン処理
+' -------------------------------------------------------------------------
+Sub ConvertPDFQueryData(targetSheetName As String)
+    Dim wb As Workbook
+    Dim wsSrc As Worksheet, wsDst As Worksheet
+    Dim lastRow As Long, r As Long
+    Dim outRow As Long
+    Dim headers As Variant      ' 出力用ヘッダー名配列
+    Dim headerKeys As Variant   ' 処理順序定義用キー配列
+    Dim colMap As Object
+    Dim isProcessing As Boolean
+    Dim currentMode As Integer  ' 5, 6, or 7 columns
+    Dim determinedMode As Integer ' タイトル行から判定されたモード
+    Dim processCount As Long
+    Dim movedFileCount As Long
+
+    ' Source.Name 制御用変数
+    Dim currentSourceName As String
+    Dim rowSourceName As String
+
+    ' 表番号の位置調整用変数
+    Dim pendingTableNumber As String
+    Dim lastTitleRow As Long
+
+    Set wb = ActiveWorkbook
+    Set wsSrc = wb.Sheets(targetSheetName)
+
+    lastRow = wsSrc.Cells(wsSrc.Rows.Count, 1).End(xlUp).Row
+
+    ' 初期化
+    isProcessing = False
+    processCount = 0
+    pendingTableNumber = ""
+    lastTitleRow = 0
+    currentSourceName = ""
+    determinedMode = 0
+    movedFileCount = 0
+    Set wsDst = Nothing
+
+    Set colMap = CreateObject("Scripting.Dictionary")
+
+    Application.ScreenUpdating = False
+
+    ' --- メインループ ---
+    For r = 1 To lastRow
+        Dim cellValFirst As String
+        Dim rowStr As String
+        Dim i As Long
+        Dim realLastCol As Long
+
+        If r Mod 50 = 0 Then
+            Application.StatusBar = "処理中... " & Int((r / lastRow) * 100) & "% 完了 (行: " & r & ")"
+            DoEvents
+        End If
+
+        ' ---------------------------------------------------------
+        ' 0. Source.Name (A列) の確認とシート切り替え判定
+        ' ---------------------------------------------------------
+        rowSourceName = Trim(wsSrc.Cells(r, 1).Value)
+
+        ' ヘッダー行("Source.Name")や空欄はスキップ、値が変わったらシート切り替え
+        If rowSourceName <> "" And rowSourceName <> "Source.Name" And rowSourceName <> currentSourceName Then
+
+            ' --- 新規シート作成処理 ---
+            currentSourceName = rowSourceName
+
+            ' 新しいファイルになったので、処理状態をリセット
+            isProcessing = False
+            pendingTableNumber = ""
+            lastTitleRow = 0
+            determinedMode = 0 ' モード判定もリセット
+
+            ' シート追加
+            Set wsDst = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+
+            ' シート名設定（エラー回避含む）
+            wsDst.Name = GetSafeSheetName(wb, currentSourceName)
+
+            outRow = 1 ' 書き出し行リセット
+        End If
+
+        ' 出力先シートがまだ無い場合（最初のヘッダー行などをスキップ中）はループ継続
+        If wsDst Is Nothing Then GoTo ContinueLoop
+
+
+        ' ---------------------------------------------------------
+        ' 1. 開始トリガー判定 (Data.Column1 = C列 を監視)
+        ' ---------------------------------------------------------
+        cellValFirst = Trim(wsSrc.Cells(r, 3).Value) ' Data.Column1 (C列)
+
+        If InStr(cellValFirst, KEYWORD_START) > 0 Then
+            isProcessing = True
+        End If
+
+        If Not isProcessing Then GoTo ContinueLoop
+
+        ' 行のデータ有効範囲（右端）を取得
+        realLastCol = GetRealLastColumn(wsSrc, r)
+
+        ' 行全体判定用文字列 (C列～)
+        Dim checkColLimit As Long
+        checkColLimit = realLastCol
+        If checkColLimit < 30 Then checkColLimit = 30
+        ' C列(3)から取得するように変更
+        rowStr = Join(Application.Transpose(Application.Transpose(wsSrc.Range(wsSrc.Cells(r, 3), wsSrc.Cells(r, checkColLimit)).Value)), "")
+
+        ' =========================================================
+        ' 判定ロジック： ①タイトル -> ②ヘッダー -> ③データ
+        ' =========================================================
+
+        Dim IsTitleRow As Boolean
+        Dim IsHeaderRow As Boolean
+        IsTitleRow = False
+        IsHeaderRow = False
+
+        ' ① タイトル行判定
+        If InStr(rowStr, "内訳") > 0 Or InStr(rowStr, "明細") > 0 Then
+            IsTitleRow = True
+        End If
+
+        ' ② ヘッダー行判定
+        If Not IsTitleRow Then
+            If (InStr(rowStr, "名") > 0 And InStr(rowStr, "数") > 0) Or _
+               (InStr(rowStr, "科目") > 0 And InStr(rowStr, "数") > 0) Then
+                IsHeaderRow = True
+            End If
+        End If
+
+        ' --- 処理分岐 ---
+
+        ' A. 表タイトル行の処理
+        If IsTitleRow Then
+
+            If outRow > 1 Then
+                If wsDst.Cells(outRow - 1, 1).Value <> "" Then outRow = outRow + 1
+            End If
+
+            Dim tableTitle As String
+            Dim tableNumber As String
+            ' タイトル取得範囲も C列(3) から
+            Call GetTitleAndNumber(wsSrc, r, 3, realLastCol, tableTitle, tableNumber)
+
+            With wsDst.Cells(outRow, 1)
+                .Value = tableTitle
+                .Font.Bold = True
+                .Font.Size = 11
+                .Interior.ColorIndex = xlNone
+            End With
+
+            If tableNumber <> "" Then
+                pendingTableNumber = tableNumber
+                lastTitleRow = outRow
+            Else
+                pendingTableNumber = ""
+                lastTitleRow = 0
+            End If
+
+            ' ■ヘッダーのモード設定（タイトル行の名称に応じて決定）
+            ' ★v5/v6/v7/v8では最優先で使用
+            determinedMode = 0 ' リセット
+            If InStr(rowStr, "工事費内訳") > 0 Or InStr(rowStr, "工事種別内訳") > 0 Then
+                determinedMode = 5
+            ElseIf InStr(rowStr, "中科目別内訳") > 0 Then
+                determinedMode = 6
+            ElseIf InStr(rowStr, "科目別内訳") > 0 Or InStr(rowStr, "種目別内訳") > 0 Then
+                determinedMode = 5
+            ElseIf InStr(rowStr, "細目別内訳") > 0 Then
+                determinedMode = 7
+            ElseIf InStr(rowStr, "別紙明細") > 0 Then
+                determinedMode = 7
+            End If
+
+            outRow = outRow + 1
+
+            ' ★v8: タイトル行とヘッダー行の間にある行を処理
+            ' 次の行がヘッダー行かどうかチェック
+            If r + 1 <= lastRow Then
+                Dim nextRowStr As String
+                Dim nextRealLastCol As Long
+                Dim nextCheckColLimit As Long
+
+                nextRealLastCol = GetRealLastColumn(wsSrc, r + 1)
+                nextCheckColLimit = nextRealLastCol
+                If nextCheckColLimit < 30 Then nextCheckColLimit = 30
+                nextRowStr = Join(Application.Transpose(Application.Transpose(wsSrc.Range(wsSrc.Cells(r + 1, 3), wsSrc.Cells(r + 1, nextCheckColLimit)).Value)), "")
+
+                ' 次の行がヘッダー行かどうか判定
+                Dim IsNextHeaderRow As Boolean
+                IsNextHeaderRow = False
+
+                ' 次の行がタイトル行でないことを確認
+                If Not (InStr(nextRowStr, "内訳") > 0 Or InStr(nextRowStr, "明細") > 0) Then
+                    ' ヘッダー行の判定
+                    If (InStr(nextRowStr, "名") > 0 And InStr(nextRowStr, "数") > 0) Or _
+                       (InStr(nextRowStr, "科目") > 0 And InStr(nextRowStr, "数") > 0) Then
+                        IsNextHeaderRow = True
+                    End If
+                End If
+
+                ' 次の行がヘッダー行でない場合、タイトルとヘッダーの間の行として処理
+                If Not IsNextHeaderRow Then
+                    ' 次の行にデータがあるか確認
+                    Dim nextRowHasData As Boolean
+                    nextRowHasData = False
+                    For i = 3 To nextRealLastCol
+                        If Trim(wsSrc.Cells(r + 1, i).Value) <> "" Then
+                            nextRowHasData = True
+                            Exit For
+                        End If
+                    Next i
+
+                    If nextRowHasData Then
+                        ' 文字の塊を抽出
+                        Dim chunks As Collection
+                        Set chunks = ExtractTextChunks(wsSrc, r + 1, 3, nextRealLastCol)
+
+                        ' 文字の塊を1列目、3列目、5列目に配置
+                        If chunks.Count >= 1 Then
+                            wsDst.Cells(outRow, 1).Value = chunks(1)
+                        End If
+                        If chunks.Count >= 2 Then
+                            wsDst.Cells(outRow, 3).Value = chunks(2)
+                        End If
+                        If chunks.Count >= 3 Then
+                            wsDst.Cells(outRow, 5).Value = chunks(3)
+                        End If
+
+                        outRow = outRow + 1
+                        r = r + 1  ' 次の行をスキップ
+                    End If
+                End If
+            End If
+
+            GoTo ContinueLoop
+
+        ' B. ヘッダー行の処理
+        ElseIf IsHeaderRow Then
+
+            colMap.RemoveAll
+            currentMode = 0
+
+            ' ★v6/v7/v8: 「摘」と「要」の検出用フラグ
+            Dim hasTeki As Boolean
+            Dim hasYou As Boolean
+            hasTeki = False
+            hasYou = False
+
+            ' 列位置特定 (C列=3 ～ 30列分走査)
+            For i = 3 To 30
+                Dim val As String
+                val = Trim(wsSrc.Cells(r, i).Value)
+                If InStr(val, "中科目") > 0 Then colMap("Item2") = i
+                If InStr(val, "中") > 0 And Not colMap.Exists("Item2") Then colMap("Item2_NakaChu") = i  ' 「中」を含む列を記録
+                If InStr(val, "科目") > 0 Or (val Like "*名称*" And Not colMap.Exists("Item1")) Then colMap("Item1") = i
+
+                ' ★v6/v7/v8: 摘要の検出強化
+                ' 「摘要」が一つのセルにある場合
+                If InStr(val, "摘要") > 0 Then
+                    colMap("Description") = i
+                    hasTeki = True
+                    hasYou = True
+                End If
+                ' 「摘」と「要」を個別に検出
+                If InStr(val, "摘") > 0 Then hasTeki = True
+                If InStr(val, "要") > 0 Then hasYou = True
+
+                If InStr(val, "数") > 0 Then colMap("Qty") = i
+                If InStr(val, "単価") > 0 Then colMap("UnitPrice") = i
+                If InStr(val, "単") > 0 Then colMap("Unit") = i
+                If InStr(val, "金") > 0 Then colMap("Amount") = i
+                If InStr(val, "備") > 0 Then colMap("Note") = i
+            Next i
+
+            ' ★v6/v7/v8: 「摘」と「要」の両方が存在する場合、Descriptionとしてマーク
+            If hasTeki And hasYou And Not colMap.Exists("Description") Then
+                colMap("Description") = -1  ' マーカーとして-1を使用（位置は後で設定）
+            End If
+
+            ' ==========================================================
+            ' ★モード判定（v6/v7/v8: タイトル行を最優先）
+            ' ==========================================================
+            ' タイトル行で判定できた場合はそれを優先
+            If determinedMode > 0 Then
+                currentMode = determinedMode
+            ' タイトル行で判定できなかった場合のみ、ヘッダー行の内容を確認
+            ElseIf realLastCol >= 22 Or colMap.Exists("Description") Or colMap.Exists("UnitPrice") Then
+                ' 摘要または単価が存在する → 7列確定
+                currentMode = 7
+            ElseIf colMap.Exists("Item2") Or colMap.Exists("Item2_NakaChu") Then
+                ' 中科目が存在する → 6列確定
+                currentMode = 6
+            ElseIf realLastCol <= 14 Then
+                ' 列数が少ない → 5列確定
+                currentMode = 5
+            Else
+                ' デフォルト: 列数で判定
+                If realLastCol >= 22 Then
+                    currentMode = 7
+                Else
+                    currentMode = 6
+                End If
+            End If
+            ' ==========================================================
+
+            Dim qtyCol As Long
+            If colMap.Exists("Qty") Then qtyCol = colMap("Qty") Else qtyCol = 10
+
+            ' ■ヘッダーのルール設定（列範囲の設定を含む）
+            Select Case currentMode
+                Case 7
+                    headers = Array("名称", "摘要", "数量", "単位", "単価", "金額", "備考")
+                    headerKeys = Array("Item1", "Description", "Qty", "Unit", "UnitPrice", "Amount", "Note")
+
+                    ' 7列モード特殊ルール：名称は3列目固定
+                    colMap("Item1") = 3
+                    colMap("Item1_End") = 3
+
+                    ' 摘要の範囲：4列目から数量列の直前まで
+                    colMap("Description_Start") = 4
+                    If Not colMap.Exists("Description") Or colMap("Description") = -1 Then
+                        colMap("Description") = qtyCol - 1
+                    End If
+                    colMap("Description_End") = qtyCol - 1
+
+                Case 6
+                    headers = Array("科目名称", "中科目名称", "数量", "単位", "金額", "備考")
+                    headerKeys = Array("Item1", "Item2", "Qty", "Unit", "Amount", "Note")
+
+                    ' 6列モード特殊ルール：「中」を含む列を探す
+                    Dim nakaChuCol As Long
+                    nakaChuCol = 0
+                    If colMap.Exists("Item2_NakaChu") Then
+                        nakaChuCol = colMap("Item2_NakaChu")
+                    ElseIf colMap.Exists("Item2") Then
+                        nakaChuCol = colMap("Item2")
+                    End If
+
+                    If nakaChuCol > 0 Then
+                        ' 科目名称：3列目から「中」列の直前まで
+                        colMap("Item1") = 3
+                        colMap("Item1_End") = nakaChuCol - 1
+
+                        ' 中科目名称：「中」列から数量列の直前まで
+                        colMap("Item2") = nakaChuCol
+                        colMap("Item2_End") = qtyCol - 1
+                    Else
+                        ' フォールバック：従来のロジック
+                        If Not colMap.Exists("Item2") Then colMap("Item2") = qtyCol - 1
+                        If Not colMap.Exists("Item1") Then colMap("Item1") = colMap("Item2") - 1
+                        colMap("Item1_End") = colMap("Item2") - 1
+                        colMap("Item2_End") = qtyCol - 1
+                    End If
+
+                Case 5
+                    headers = Array("名称", "数量", "単位", "金額", "備考")
+                    headerKeys = Array("Item1", "Qty", "Unit", "Amount", "Note")
+                    If Not colMap.Exists("Item1") Then colMap("Item1") = qtyCol - 1
+            End Select
+
+            ' 保留していた表番号を備考列上へ書き込み
+            If pendingTableNumber <> "" And lastTitleRow > 0 Then
+                Dim noteColIndex As Long
+                noteColIndex = UBound(headers) + 1
+                With wsDst.Cells(lastTitleRow, noteColIndex)
+                    .Value = pendingTableNumber
+                    .Font.Bold = True
+                    .HorizontalAlignment = xlCenter
+                End With
+                pendingTableNumber = ""
+                lastTitleRow = 0
+            End If
+
+            ' ヘッダー出力
+            wsDst.Cells(outRow, 1).Resize(1, UBound(headers) + 1).Value = headers
+            wsDst.Cells(outRow, 1).Resize(1, UBound(headers) + 1).Font.Bold = True
+            wsDst.Cells(outRow, 1).Resize(1, UBound(headers) + 1).Interior.Color = RGB(220, 230, 241)
+            outRow = outRow + 1
+
+            GoTo ContinueLoop
+
+        ' C. データ行の転記処理
+        ElseIf colMap.Count > 0 And currentMode > 0 Then
+
+            Dim prevCol As Long
+            Dim cIdx As Long
+            Dim hasData As Boolean
+            hasData = False
+
+            Dim targetRowRng As Range
+            Set targetRowRng = wsDst.Cells(outRow, 1).Resize(1, UBound(headers) + 1)
+
+            ' モード別データ取得処理
+            If currentMode = 7 Then
+                ' ===== 7列モード特殊処理 =====
+                ' 名称：3列目固定
+                targetRowRng.Cells(1, 1).Value = Trim(wsSrc.Cells(r, 3).Value)
+                If Trim(wsSrc.Cells(r, 3).Value) <> "" Then hasData = True
+
+                ' 摘要：4列目から数量列の直前まで（空白をスキップして値がある範囲）
+                Dim descStartCol As Long, descEndCol As Long
+                descStartCol = 4
+                descEndCol = colMap("Description_End")
+
+                ' 名称の右の列（4列目）が空白の場合、数字または「数」列が現れるまでを摘要とする
+                Dim descVal As String
+                descVal = ""
+
+                For i = descStartCol To descEndCol
+                    Dim cellValue As String
+                    cellValue = Trim(wsSrc.Cells(r, i).Value)
+                    If cellValue <> "" Then
+                        ' 値がある場合、数値かチェック
+                        If IsNumeric(cellValue) Then
+                            ' 数値が現れたら摘要範囲終了
+                            Exit For
+                        Else
+                            ' 数値でない場合は摘要として結合
+                            If descVal = "" Then
+                                descVal = cellValue
+                            Else
+                                descVal = descVal & " " & cellValue
+                            End If
+                        End If
+                    End If
+                Next i
+
+                targetRowRng.Cells(1, 2).Value = descVal
+
+                ' 残りの項目（数量、単位、単価、金額、備考）は通常処理
+                prevCol = descEndCol
+                For cIdx = 2 To UBound(headerKeys)  ' Description の次から
+                    Dim key As String
+                    Dim targetCol As Long
+                    Dim mergedVal As String
+
+                    key = headerKeys(cIdx)
+                    mergedVal = ""
+
+                    If colMap.Exists(key) Then
+                        targetCol = colMap(key)
+                        If targetCol > prevCol Then
+                            mergedVal = GetMergedValue(wsSrc, r, prevCol + 1, targetCol)
+                            prevCol = targetCol
+                        End If
+
+                        targetRowRng.Cells(1, cIdx + 1).Value = mergedVal
+                        If key = "Qty" And mergedVal <> "" Then hasData = True
+                    End If
+                Next cIdx
+
+            ElseIf currentMode = 6 Then
+                ' ===== 6列モード特殊処理 =====
+                ' 科目名称：設定された範囲から取得
+                If colMap.Exists("Item1_End") Then
+                    targetRowRng.Cells(1, 1).Value = GetMergedValue(wsSrc, r, colMap("Item1"), colMap("Item1_End"))
+                Else
+                    targetRowRng.Cells(1, 1).Value = GetMergedValue(wsSrc, r, 3, colMap("Item1"))
+                End If
+                If targetRowRng.Cells(1, 1).Value <> "" Then hasData = True
+
+                ' 中科目名称：設定された範囲から取得
+                If colMap.Exists("Item2_End") Then
+                    targetRowRng.Cells(1, 2).Value = GetMergedValue(wsSrc, r, colMap("Item2"), colMap("Item2_End"))
+                Else
+                    targetRowRng.Cells(1, 2).Value = Trim(wsSrc.Cells(r, colMap("Item2")).Value)
+                End If
+
+                ' 残りの項目（数量、単位、金額、備考）は通常処理
+                prevCol = colMap("Item2_End")
+                For cIdx = 2 To UBound(headerKeys)  ' Item2 の次から
+                    key = headerKeys(cIdx)
+                    mergedVal = ""
+
+                    If colMap.Exists(key) Then
+                        targetCol = colMap(key)
+                        If targetCol > prevCol Then
+                            mergedVal = GetMergedValue(wsSrc, r, prevCol + 1, targetCol)
+                            prevCol = targetCol
+                        End If
+
+                        targetRowRng.Cells(1, cIdx + 1).Value = mergedVal
+                        If key = "Qty" And mergedVal <> "" Then hasData = True
+                    End If
+                Next cIdx
+
+            Else
+                ' ===== 5列モードまたは従来の処理 =====
+                prevCol = 2
+                For cIdx = LBound(headerKeys) To UBound(headerKeys)
+                    key = headerKeys(cIdx)
+                    mergedVal = ""
+
+                    If colMap.Exists(key) Then
+                        targetCol = colMap(key)
+                        If targetCol > prevCol Then
+                            mergedVal = GetMergedValue(wsSrc, r, prevCol + 1, targetCol)
+                            prevCol = targetCol
+                        End If
+
+                        targetRowRng.Cells(1, cIdx + 1).Value = mergedVal
+                        If (key = "Item1" Or key = "Qty") And mergedVal <> "" Then hasData = True
+                    End If
+                Next cIdx
+            End If
+
+            If hasData Then
+                ' 数量・単位の正規化
+                Call CleanUpQtyAndUnit(targetRowRng, currentMode)
+
+                ' ★v7/v8: 単位への「式」自動補完ロジックを削除
+                ' 元のデータをそのまま転記する
+
+                outRow = outRow + 1
+                processCount = processCount + 1
+            Else
+                wsDst.Rows(outRow).ClearContents
+            End If
+        End If
+
+ContinueLoop:
+    Next r
+
+    ' 全シートの列幅調整
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If ws.Name <> targetSheetName Then
+            ws.Columns.AutoFit
+        End If
+    Next ws
+
+    ' --- ファイル移動処理の呼び出し ---
+    Application.StatusBar = "ファイルを移動中..."
+    Call MoveProcessedFiles(movedFileCount)
+
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+
+    MsgBox "変換およびファイルの移動が完了しました。" & vbCrLf & _
+           "抽出行数(合計): " & processCount & vbCrLf & _
+           "移動ファイル数: " & movedFileCount, vbInformation
+End Sub
+
+' -------------------------------------------------------------------------
+' ★v8: 文字の塊を抽出する関数
+' -------------------------------------------------------------------------
+Function ExtractTextChunks(ws As Worksheet, rowIdx As Long, startCol As Long, endCol As Long) As Collection
+    Dim chunks As Collection
+    Set chunks = New Collection
+
+    Dim currentChunk As String
+    Dim c As Long
+    Dim val As String
+
+    currentChunk = ""
+
+    For c = startCol To endCol
+        val = Trim(ws.Cells(rowIdx, c).Value)
+        If val <> "" Then
+            ' 空白でない値がある場合
+            If currentChunk = "" Then
+                currentChunk = val
+            Else
+                currentChunk = currentChunk & " " & val
+            End If
         Else
-            ' 開くのに失敗した場合のエラーログ出力等は必要に応じて追加
-            Err.Clear
+            ' 空白がある場合、現在の塊を保存
+            If currentChunk <> "" Then
+                chunks.Add currentChunk
+                currentChunk = ""
+            End If
         End If
+    Next c
+
+    ' 最後の塊を保存
+    If currentChunk <> "" Then
+        chunks.Add currentChunk
+    End If
+
+    Set ExtractTextChunks = chunks
+End Function
+
+' -------------------------------------------------------------------------
+' ファイル移動処理 (修正版)
+' -------------------------------------------------------------------------
+Sub MoveProcessedFiles(ByRef movedCount As Long)
+    Dim fso As Object
+    Dim srcFolderStr As String
+    Dim dstFolderStr As String
+    Dim folderSrc As Object
+    Dim fileItem As Object
+    Dim wbPath As String
+
+    movedCount = 0
+    wbPath = ActiveWorkbook.Path
+
+    ' OneDriveパス対策: httpで始まるパスはFSOで扱えないため警告を出して終了
+    If LCase(Left(wbPath, 4)) = "http" Then
+        MsgBox "注意: 現在のファイルはOneDrive等のクラウド上にあり、パスがURL形式になっています。" & vbCrLf & _
+               "ファイル移動処理はローカルドライブ（C:\...など）でのみ動作します。" & vbCrLf & _
+               "移動処理をスキップします。", vbExclamation
+        Exit Sub
+    End If
+
+    ' フォルダパスの構築 (末尾の \ なしで構築)
+    srcFolderStr = wbPath & "\" & FOLDER_NAME_SRC
+    dstFolderStr = wbPath & "\" & FOLDER_NAME_DST
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    ' 移動元フォルダの存在確認
+    If Not fso.FolderExists(srcFolderStr) Then
+        MsgBox "移動元フォルダが見つかりません：" & vbCrLf & srcFolderStr & vbCrLf & _
+               "フォルダ名が正しいか、Excelと同じ場所にフォルダがあるか確認してください。", vbExclamation
+        Set fso = Nothing
+        Exit Sub
+    End If
+
+    ' 移動先フォルダの存在確認（なければ作成を試みる）
+    If Not fso.FolderExists(dstFolderStr) Then
+        On Error Resume Next
+        fso.CreateFolder dstFolderStr
         On Error GoTo 0
-        
-    End If
-    
-    ' 次のファイル名を取得
-    fileName = Dir()
-Loop
-
-
-Cleanup:
-' 設定を元に戻す
-With Application
-.ScreenUpdating = True
-.Calculation = xlCalculationAutomatic
-.DisplayAlerts = True
-.EnableEvents = True
-End With
-
-MsgBox "処理が完了しました。" & vbCrLf & "処理ファイル数: " & processedCount & " 件", vbInformation
-
-Set fso = Nothing
-Set wb = Nothing
-
-
-End Sub
-
-' ==============================================================================
-' 個別処理: ブック内の各シートに対して書式設定・計算式挿入を実行
-' ==============================================================================
-Sub ProcessWorkbook(wb As Workbook)
-Dim ws As Worksheet
-Dim lastRow As Long
-Dim lastCol As Long
-
-For Each ws In wb.Worksheets
-    ' 最終行の取得（A列基準）
-    lastRow = ws.Cells(ws.Rows.count, "A").End(xlUp).Row
-    
-    ' データが存在しない場合はスキップ
-    If lastRow < DATA_START_ROW Then GoTo NextSheet
-    
-    ' ヘッダー行(3行目)の最終列を取得してパターン判定
-    ' ※要件では「2行目(ヘッダー行)」という記載もありましたが、
-    '   「3行目をヘッダー行とする」という定義を優先しています。
-    lastCol = ws.Cells(HEADER_ROW, ws.Columns.count).End(xlToLeft).Column
-    
-    ' パターンごとの処理
-    Select Case lastCol
-        Case 5 ' パターンA: A～E列 (5列)
-            ' E列の書式設定
-            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
-            
-        Case 6 ' パターンB: A～F列 (6列)
-            ' E列の書式設定（要件の「E列」に従う）
-            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
-            
-        Case 7 ' パターンC: A～G列 (7列)
-            ' C, E, F列の書式設定
-            Call SetColumnFormat(ws, "C", DATA_START_ROW, lastRow)
-            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
-            Call SetColumnFormat(ws, "F", DATA_START_ROW, lastRow)
-            
-            ' 計算式の挿入
-            Call InsertCalculations(ws, DATA_START_ROW, lastRow)
-            
-    End Select
-
-
-NextSheet:
-Next ws
-End Sub
-
-' ==============================================================================
-' 共通処理: 指定列の書式設定
-' ==============================================================================
-Private Sub SetColumnFormat(ws As Worksheet, colName As String, startRow As Long, endRow As Long)
-With ws.Range(colName & startRow & ":" & colName & endRow)
-.HorizontalAlignment = xlRight  ' 右寄せ
-.VerticalAlignment = xlBottom   ' 下揃え
-.WrapText = False               ' 折り返し解除
-.IndentLevel = 0                ' インデント0
-End With
-End Sub
-
-' ==============================================================================
-' パターンC用: 計算式の挿入ロジック
-' ==============================================================================
-Private Sub InsertCalculations(ws As Worksheet, startRow As Long, endRow As Long)
-Dim i As Long
-Dim currentSumStartRow As Long
-Dim cellValA As String
-Dim cellValD As String
-
-' SUM関数の開始行を初期化
-currentSumStartRow = startRow
-
-For i = startRow To endRow
-    cellValA = ws.Cells(i, "A").Value
-    cellValD = ws.Cells(i, "D").Value
-    
-    ' 条件1: A列に「計」が含まれている場合
-    If InStr(cellValA, "計") > 0 Then
-        ' F列に SUM(開始行 : 現在行の一つ上) を入力
-        ' SUM対象の行が存在する場合のみ数式を入れる
-        If i > currentSumStartRow Then
-            ws.Cells(i, "F").Formula = "=SUM(F" & currentSumStartRow & ":F" & (i - 1) & ")"
+        If Not fso.FolderExists(dstFolderStr) Then
+            MsgBox "移動先フォルダの作成に失敗しました：" & vbCrLf & dstFolderStr & vbCrLf & _
+                   "移動処理をスキップします。", vbExclamation
+            Set fso = Nothing
+            Exit Sub
         End If
-        
-        ' 次のSUM区間の開始行を更新（現在の行の次から）
-        currentSumStartRow = i + 1
-        
-    ' 条件2: D列（単位）が空欄ではない場合
-    ElseIf cellValD <> "" Then
-        ' F列 = C列 * E列
-        ws.Cells(i, "F").Formula = "=C" & i & "*E" & i
-        
     End If
-Next i
 
+    ' フォルダオブジェクト取得
+    Set folderSrc = fso.GetFolder(srcFolderStr)
 
+    ' ファイルループして移動
+    For Each fileItem In folderSrc.Files
+        ' 隠しファイルやシステムファイル(Thumbs.db等)はスキップ
+        If (fileItem.Attributes And 2) = 0 And (fileItem.Attributes And 4) = 0 Then
+            Dim destFile As String
+            destFile = dstFolderStr & "\" & fileItem.Name
+
+            ' エラーハンドリング：ファイル単位で行う
+            On Error Resume Next
+
+            ' 同名ファイルが移動先にある場合は削除（上書き移動のため）
+            If fso.FileExists(destFile) Then
+                fso.DeleteFile destFile, True
+                If Err.Number <> 0 Then
+                    ' 削除失敗時（ファイルが開かれている等）はメッセージを出してこのファイルはスキップ
+                    MsgBox "移動先の同名ファイルを削除できませんでした（使用中の可能性があります）：" & vbCrLf & _
+                           fileItem.Name, vbExclamation
+                    Err.Clear
+                    GoTo NextFile
+                End If
+            End If
+
+            ' 移動実行
+            fileItem.Move destFile
+            If Err.Number <> 0 Then
+                MsgBox "ファイルの移動に失敗しました：" & vbCrLf & fileItem.Name & vbCrLf & _
+                       "エラー: " & Err.Description, vbExclamation
+                Err.Clear
+            Else
+                movedCount = movedCount + 1
+            End If
+            On Error GoTo 0
+        End If
+NextFile:
+    Next fileItem
+
+    Set fso = Nothing
 End Sub
 
+' -------------------------------------------------------------------------
+' ユニークで安全なシート名を生成する関数
+' -------------------------------------------------------------------------
+Function GetSafeSheetName(wb As Workbook, candidateName As String) As String
+    Dim safeName As String
+    Dim i As Long
+    Dim tempName As String
+
+    ' 1. 禁止文字の置換 ( \ / ? * [ ] : )
+    safeName = candidateName
+    safeName = Replace(safeName, ":", "_")
+    safeName = Replace(safeName, "\", "_")
+    safeName = Replace(safeName, "/", "_")
+    safeName = Replace(safeName, "?", "_")
+    safeName = Replace(safeName, "*", "_")
+    safeName = Replace(safeName, "[", "_")
+    safeName = Replace(safeName, "]", "_")
+
+    ' 2. 長さ制限 (31文字以内)
+    If Len(safeName) > 31 Then
+        safeName = Left(safeName, 31)
+    End If
+
+    ' 3. 重複チェックと連番付与
+    tempName = safeName
+    i = 1
+    Do While SheetExists(wb, tempName)
+        Dim numSuffix As String
+        numSuffix = "(" & i & ")"
+        If Len(safeName) + Len(numSuffix) > 31 Then
+            tempName = Left(safeName, 31 - Len(numSuffix)) & numSuffix
+        Else
+            tempName = safeName & numSuffix
+        End If
+        i = i + 1
+    Loop
+
+    GetSafeSheetName = tempName
+End Function
+
+Function SheetExists(wb As Workbook, shName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(shName)
+    On Error GoTo 0
+    SheetExists = Not (ws Is Nothing)
+End Function
+
+' -------------------------------------------------------------------------
+' 空白に見えるセルを無視して、真のデータ最終列番号を返す関数
+' -------------------------------------------------------------------------
+Function GetRealLastColumn(ws As Worksheet, r As Long) As Long
+    Dim c As Long
+    ' Excelの認識する最終列から左へ探索
+    For c = ws.Cells(r, ws.Columns.Count).End(xlToLeft).Column To 1 Step -1
+        If Trim(ws.Cells(r, c).Value) <> "" Then
+            GetRealLastColumn = c
+            Exit Function
+        End If
+    Next c
+    GetRealLastColumn = 1 ' 全て空なら1を返す
+End Function
+
+' -------------------------------------------------------------------------
+' 以下、既存ヘルパー関数
+' -------------------------------------------------------------------------
+
+Function GetMergedValue(ws As Worksheet, rowIdx As Long, startCol As Long, endCol As Long) As String
+    Dim c As Long
+    Dim res As String, val As String
+    res = ""
+    For c = startCol To endCol
+        val = Trim(ws.Cells(rowIdx, c).Value)
+        If val <> "" Then
+            If res = "" Then res = val Else res = res & " " & val
+        End If
+    Next c
+    GetMergedValue = res
+End Function
+
+Sub GetTitleAndNumber(ws As Worksheet, rowIdx As Long, startCol As Long, endCol As Long, ByRef retTitle As String, ByRef retNum As String)
+    Dim c As Long
+    Dim val As String
+    Dim foundNum As Boolean
+    retTitle = ""
+    retNum = ""
+    foundNum = False
+    For c = startCol To endCol
+        val = Trim(ws.Cells(rowIdx, c).Value)
+        If val <> "" Then
+            If Not foundNum And IsNumeric(val) Then
+                retNum = val
+                foundNum = True
+            Else
+                If retTitle = "" Then retTitle = val Else retTitle = retTitle & " " & val
+            End If
+        End If
+    Next c
+End Sub
+
+Sub CleanUpQtyAndUnit(rngRow As Range, mode As Integer)
+    Dim colQty As Integer, colUnit As Integer
+    Dim valQty As String, valUnit As String
+    Dim numPart As String, strPart As String
+    Select Case mode
+        Case 5: colQty = 2: colUnit = 3
+        Case 6: colQty = 3: colUnit = 4
+        Case 7: colQty = 3: colUnit = 4
+    End Select
+    valQty = Trim(rngRow.Cells(1, colQty).Value)
+    valUnit = Trim(rngRow.Cells(1, colUnit).Value)
+    If valQty <> "" And Not IsNumeric(valQty) Then
+        Call SplitNumAndUnit(valQty, numPart, strPart)
+        If numPart <> "" Then
+            valQty = numPart
+            If strPart <> "" Then
+                If valUnit = "" Then valUnit = strPart Else valUnit = strPart & " " & valUnit
+            End If
+        End If
+    End If
+    If valUnit <> "" And IsNumeric(Left(valUnit, 1)) Then
+        Call SplitNumAndUnit(valUnit, numPart, strPart)
+        If numPart <> "" Then
+            If valQty = "" Then valQty = numPart
+            valUnit = strPart
+        End If
+    End If
+    rngRow.Cells(1, colQty).Value = valQty
+    rngRow.Cells(1, colUnit).Value = valUnit
+End Sub
+
+Sub SplitNumAndUnit(txt As String, ByRef retNum As String, ByRef retStr As String)
+    Dim i As Long
+    Dim c As String
+    Dim boundary As Long
+    retNum = ""
+    retStr = ""
+    boundary = 0
+    For i = 1 To Len(txt)
+        c = Mid(txt, i, 1)
+        If IsNumeric(c) Or c = "." Or c = "," Then
+            boundary = i
+        ElseIf c = " " Or c = "　" Then
+            Exit For
+        Else
+            Exit For
+        End If
+    Next i
+    If boundary > 0 Then
+        retNum = Trim(Left(txt, boundary))
+        retStr = Trim(Mid(txt, i))
+    Else
+        retStr = txt
+    End If
+End Sub
 
 

@@ -1,0 +1,316 @@
+Sub CreateFormattedTableBook()
+    Dim wbSource As Workbook
+    Dim wsSource As Worksheet
+    Dim wbNew As Workbook
+    Dim wsNew As Worksheet
+    Dim lastRow As Long
+    Dim r As Long, nextHeaderRow As Long
+    Dim colCount As Long
+    Dim titleRow As Long, detailRow As Long, dataStartRow As Long, dataEndRow As Long
+    Dim hasDetail As Boolean
+    Dim headerKeywords As Variant
+    Dim i As Long
+    
+    ' 削除対象シートリストと出力フォルダ用変数
+    Dim sheetsToDelete As Collection
+    Set sheetsToDelete = New Collection
+    Dim outputFolder As String
+    Dim saveName As String
+    Dim fileNameBase As String
+    Dim isSaved As Boolean
+    
+    ' --- 設定 ---
+    Set wbSource = ThisWorkbook
+    
+    ' 出力フォルダの設定（同階層の"変換完了"フォルダ）
+    outputFolder = wbSource.Path & "\変換完了"
+    
+    ' フォルダが存在しない場合は作成
+    If Dir(outputFolder, vbDirectory) = "" Then
+        MkDir outputFolder
+    End If
+    
+    ' ヘッダー判定用のキーワード（これらが含まれる行をヘッダーとみなす）
+    headerKeywords = Array("名称", "科目", "数量", "単位", "金額", "備考", "摘要")
+    
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' --- 全シートをループ ---
+    For Each wsSource In wbSource.Worksheets
+        
+        ' --- 処理対象外シートの判定 ---
+        ' 指定された除外シート名、およびテンプレート用シート名はスキップ
+        Select Case wsSource.Name
+            Case "参考数量書PDF_変換前", "buttom", "5列header", "6列header", "7列header"
+                ' 何もしない（スキップ）
+                GoTo NextSheet
+        End Select
+        
+        ' --------------------------------------------------
+        ' 対象シートごとの処理開始
+        ' --------------------------------------------------
+        
+        Set wbNew = Workbooks.Add
+        isSaved = False ' 保存フラグを初期化
+        
+        lastRow = wsSource.Cells(wsSource.Rows.Count, "A").End(xlUp).Row
+        r = 1
+        
+        ' 行走査ループ
+        Do While r <= lastRow
+            
+            ' 現在の行がヘッダーか判定
+            If CheckIfHeader(wsSource.Rows(r), headerKeywords) Then
+                
+                ' --- ヘッダー情報の取得 ---
+                colCount = wsSource.Cells(r, 1).End(xlToRight).Column
+                
+                ' 5, 6, 7列以外は想定外としてスキップ
+                If colCount < 5 Or colCount > 7 Then
+                    GoTo SkipBlock
+                End If
+                
+                ' --- タイトル行・詳細タイトル行の特定 ---
+                titleRow = 0
+                detailRow = 0
+                hasDetail = False
+                
+                If r > 1 Then
+                    If Not IsError(wsSource.Cells(r - 1, 1).Value) Then
+                        If wsSource.Cells(r - 1, 1).Value <> "" Then
+                            ' r-1にデータあり。r-2を確認
+                            Dim isTitleAtR2 As Boolean
+                            isTitleAtR2 = False
+                            
+                            If r > 2 Then
+                                If Not IsError(wsSource.Cells(r - 2, 1).Value) Then
+                                    If wsSource.Cells(r - 2, 1).Value <> "" Then
+                                        isTitleAtR2 = True
+                                    End If
+                                End If
+                            End If
+                            
+                            If isTitleAtR2 Then
+                                titleRow = r - 2
+                                detailRow = r - 1
+                                hasDetail = True
+                            Else
+                                titleRow = r - 1
+                                hasDetail = False
+                            End If
+                        End If
+                    End If
+                End If
+                
+                If titleRow = 0 Then titleRow = r - 1 ' 安全策
+                
+                ' --- 次のヘッダーを探す ---
+                nextHeaderRow = lastRow + 1
+                For i = r + 1 To lastRow
+                    If CheckIfHeader(wsSource.Rows(i), headerKeywords) Then
+                        nextHeaderRow = i
+                        Exit For
+                    End If
+                Next i
+                
+                ' --- データ範囲の特定 ---
+                dataStartRow = r + 1
+                dataEndRow = nextHeaderRow - 1
+                
+                ' 次のブロックのタイトル行を除外する処理
+                ' 【修正箇所】「計」が含まれる行はタイトル行とみなさず、データ行として残す
+                Dim checkRow As Long
+                For checkRow = nextHeaderRow - 1 To nextHeaderRow - 2 Step -1
+                    If checkRow >= dataStartRow Then
+                        If Not IsError(wsSource.Cells(checkRow, 1).Value) Then
+                            Dim cellVal As String
+                            cellVal = Trim(wsSource.Cells(checkRow, 1).Value)
+                            
+                            If cellVal <> "" Then
+                                ' ★ここに修正を追加: 「計」が含まれていない場合のみ除外処理を行う
+                                If InStr(cellVal, "計") = 0 Then
+                                    dataEndRow = checkRow - 1
+                                End If
+                            End If
+                        End If
+                    End If
+                Next checkRow
+                
+                ' --- テンプレートシートのコピー ---
+                Dim templateName As String
+                templateName = colCount & "列header"
+                
+                On Error Resume Next
+                wbSource.Sheets(templateName).Copy After:=wbNew.Sheets(wbNew.Sheets.Count)
+                If Err.Number <> 0 Then
+                    MsgBox "シート[" & wsSource.Name & "]の処理中エラー: " & vbCrLf & _
+                           "テンプレート '" & templateName & "' がこのブック内に見つかりません。", vbCritical
+                    Err.Clear
+                    On Error GoTo 0
+                    GoTo CloseNewBook ' エラー時は保存せずに閉じる
+                End If
+                On Error GoTo 0
+                
+                ' コピーされたシート（末尾のシート）を確実に取得
+                Set wsNew = wbNew.Sheets(wbNew.Sheets.Count)
+                
+                ' --- 表番号の取得とシート名設定 ---
+                Dim tableNum As String
+                tableNum = ""
+                
+                If titleRow > 0 Then
+                    tableNum = wsSource.Cells(titleRow, colCount).Text
+                End If
+                
+                ' 重要: 表番号が無い(=シート名がTable_数字になる)場合は、不要なシートとみなして処理を中断・削除する
+                If tableNum = "" Then
+                    ' 作成したテンプレートコピーを削除
+                    Application.DisplayAlerts = False
+                    wsNew.Delete
+                    Application.DisplayAlerts = False ' 念のため再設定
+                    ' このブロックの処理は終了し、次のヘッダー検索へ
+                    r = nextHeaderRow
+                    GoTo SkipBlock
+                End If
+                
+                ' シート名設定
+                On Error Resume Next
+                wsNew.Name = tableNum
+                If Err.Number <> 0 Then
+                    wsNew.Name = tableNum & "_" & r
+                    Err.Clear
+                End If
+                On Error GoTo 0
+                
+                ' --- 転記処理 ---
+                
+                ' 1. タイトル & 表番号
+                If titleRow > 0 Then
+                    wsNew.Range("A1").Value = wsSource.Cells(titleRow, 1).Value
+                    wsNew.Cells(1, colCount).Value = tableNum
+                End If
+                
+                ' 2. 詳細タイトル
+                If hasDetail Then
+                    wsNew.Range("A2").Value = wsSource.Cells(detailRow, 1).Value
+                Else
+                    wsNew.Range("A2").Value = ""
+                End If
+                
+                ' 3. ヘッダー (値のみ貼り付け。書式はテンプレートのまま)
+                wsSource.Range(wsSource.Cells(r, 1), wsSource.Cells(r, colCount)).Copy
+                wsNew.Range("A3").PasteSpecial Paste:=xlPasteValues
+                
+                ' 4. データ本体
+                If dataEndRow >= dataStartRow Then
+                    Dim rowsCount As Long
+                    rowsCount = dataEndRow - dataStartRow + 1
+                    
+                    ' 値の貼り付け
+                    wsSource.Range(wsSource.Cells(dataStartRow, 1), wsSource.Cells(dataEndRow, colCount)).Copy
+                    wsNew.Range("A4").PasteSpecial Paste:=xlPasteValues
+                    
+                    ' 書式の調整:
+                    If rowsCount > 1 Then
+                        wsNew.Rows(4).Copy
+                        wsNew.Range("A5").Resize(rowsCount - 1, colCount).PasteSpecial Paste:=xlPasteFormats
+                    End If
+                    
+                    ' 罫線を確実にする
+                    Dim dataRange As Range
+                    Set dataRange = wsNew.Range("A4").Resize(rowsCount, colCount)
+                    With dataRange.Borders
+                        .LineStyle = xlContinuous
+                        .Weight = xlThin
+                    End With
+                End If
+                
+                ' --- 列幅の明示的設定（追加箇所） ---
+                Select Case colCount
+                    Case 5
+                        wsNew.Columns(1).ColumnWidth = 44
+                        wsNew.Columns(2).ColumnWidth = 14.3
+                        wsNew.Columns(3).ColumnWidth = 4.5
+                        wsNew.Columns(4).ColumnWidth = 32
+                        wsNew.Columns(5).ColumnWidth = 19.2
+                    Case 6
+                        wsNew.Columns(1).ColumnWidth = 21
+                        wsNew.Columns(2).ColumnWidth = 21
+                        wsNew.Columns(3).ColumnWidth = 21
+                        wsNew.Columns(4).ColumnWidth = 4.5
+                        wsNew.Columns(5).ColumnWidth = 32
+                        wsNew.Columns(6).ColumnWidth = 19.2
+                    Case 7
+                        wsNew.Columns(1).ColumnWidth = 12
+                        wsNew.Columns(2).ColumnWidth = 24.5
+                        wsNew.Columns(3).ColumnWidth = 19.2
+                        wsNew.Columns(4).ColumnWidth = 4.5
+                        wsNew.Columns(5).ColumnWidth = 14.5
+                        wsNew.Columns(6).ColumnWidth = 19.2
+                        wsNew.Columns(7).ColumnWidth = 19.2
+                End Select
+                
+                Application.CutCopyMode = False ' コピー状態解除
+                
+                r = nextHeaderRow
+            Else
+                r = r + 1
+            End If
+            
+SkipBlock:
+            DoEvents
+        Loop
+        
+        ' --- 新規ブックの仕上げと保存 ---
+        
+        ' 不要なデフォルトシートを削除
+        Dim s As Worksheet
+        For Each s In wbNew.Sheets
+            If s.Name Like "Sheet*" Then
+                On Error Resume Next
+                s.Delete
+                On Error GoTo 0
+            End If
+        Next s
+        
+        ' シートが1枚以上ある = 有効な表(Table_数字ではない)があったとみなし保存
+        If wbNew.Sheets.Count >= 1 Then
+            ' ファイル名から ".pdf" を削除（大文字小文字区別なし）
+            fileNameBase = Replace(wsSource.Name, ".pdf", "", , , vbTextCompare)
+            saveName = outputFolder & "\" & fileNameBase & ".xlsx"
+            
+            ' 同名ファイルがあれば削除
+            If Dir(saveName) <> "" Then
+                Kill saveName
+            End If
+            
+            wbNew.SaveAs fileName:=saveName
+            isSaved = True ' 保存成功フラグを立てる
+        End If
+        
+CloseNewBook:
+        wbNew.Close SaveChanges:=False
+        
+        ' 保存が成功した場合は、このシートを削除対象リストに追加
+        If isSaved Then
+            sheetsToDelete.Add wsSource
+        End If
+        
+NextSheet:
+    Next wsSource
+    
+    ' --- 処理済みシートの一括削除 ---
+    Dim delWs As Worksheet
+    For Each delWs In sheetsToDelete
+        Application.DisplayAlerts = False
+        delWs.Delete
+    Next delWs
+    
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    
+    MsgBox "全シートの処理が完了しました。" & vbCrLf & "保存先: " & outputFolder
+
+End Sub
+

@@ -1,0 +1,187 @@
+Option Explicit
+
+' ==============================================================================
+' 定数定義（メンテナンスしやすいように値をここで管理）
+' ==============================================================================
+Private Const TARGET_FOLDER_NAME As String = "変換完了" ' 処理対象フォルダ名
+Private Const HEADER_ROW As Long = 3                    ' ヘッダー行番号
+Private Const DATA_START_ROW As Long = 4                ' データ開始行番号
+
+' ==============================================================================
+' メイン処理: フォルダ内の全ファイルを巡回
+' ==============================================================================
+Sub FormatAndCalculateAllFilesInFolder()
+Dim fso As Object
+Dim targetPath As String
+Dim fileName As String
+Dim wb As Workbook
+Dim processedCount As Long
+
+' 画面更新・自動計算等の停止（高速化）
+With Application
+    .ScreenUpdating = False
+    .Calculation = xlCalculationManual
+    .DisplayAlerts = False
+    .EnableEvents = False
+End With
+
+' 対象フォルダパスの構築
+' マクロブックと同じ親フォルダ内の「変換完了」フォルダ
+targetPath = ThisWorkbook.Path & "\" & TARGET_FOLDER_NAME & "\"
+
+' フォルダの存在確認
+Set fso = CreateObject("Scripting.FileSystemObject")
+If Not fso.FolderExists(targetPath) Then
+    MsgBox "対象フォルダが見つかりません：" & vbCrLf & targetPath, vbExclamation
+    GoTo Cleanup
+End If
+
+' フォルダ内の最初のファイル名を取得
+fileName = Dir(targetPath & "*.xls*")
+
+processedCount = 0
+
+' ファイル巡回処理
+Do While fileName <> ""
+    ' 除外条件: マクロブック自身、一時ファイル(~$で始まる)
+    If fileName <> ThisWorkbook.Name And Left(fileName, 2) <> "~$" Then
+        
+        ' エラーがあっても次のファイルへ進む
+        On Error Resume Next
+        Set wb = Workbooks.Open(targetPath & fileName)
+        
+        If Err.Number = 0 Then
+            ' 個別処理の実行
+            Call ProcessWorkbook(wb)
+            
+            ' 保存して閉じる
+            wb.Close SaveChanges:=True
+            processedCount = processedCount + 1
+        Else
+            ' 開くのに失敗した場合のエラーログ出力等は必要に応じて追加
+            Err.Clear
+        End If
+        On Error GoTo 0
+        
+    End If
+    
+    ' 次のファイル名を取得
+    fileName = Dir()
+Loop
+
+
+Cleanup:
+' 設定を元に戻す
+With Application
+.ScreenUpdating = True
+.Calculation = xlCalculationAutomatic
+.DisplayAlerts = True
+.EnableEvents = True
+End With
+
+MsgBox "処理が完了しました。" & vbCrLf & "処理ファイル数: " & processedCount & " 件", vbInformation
+
+Set fso = Nothing
+Set wb = Nothing
+
+
+End Sub
+
+' ==============================================================================
+' 個別処理: ブック内の各シートに対して書式設定・計算式挿入を実行
+' ==============================================================================
+Sub ProcessWorkbook(wb As Workbook)
+Dim ws As Worksheet
+Dim lastRow As Long
+Dim lastCol As Long
+
+For Each ws In wb.Worksheets
+    ' 最終行の取得（A列基準）
+    lastRow = ws.Cells(ws.Rows.count, "A").End(xlUp).Row
+    
+    ' データが存在しない場合はスキップ
+    If lastRow < DATA_START_ROW Then GoTo NextSheet
+    
+    ' ヘッダー行(3行目)の最終列を取得してパターン判定
+    ' ※要件では「2行目(ヘッダー行)」という記載もありましたが、
+    '   「3行目をヘッダー行とする」という定義を優先しています。
+    lastCol = ws.Cells(HEADER_ROW, ws.Columns.count).End(xlToLeft).Column
+    
+    ' パターンごとの処理
+    Select Case lastCol
+        Case 5 ' パターンA: A～E列 (5列)
+            ' E列の書式設定
+            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+            
+        Case 6 ' パターンB: A～F列 (6列)
+            ' E列の書式設定（要件の「E列」に従う）
+            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+            
+        Case 7 ' パターンC: A～G列 (7列)
+            ' C, E, F列の書式設定
+            Call SetColumnFormat(ws, "C", DATA_START_ROW, lastRow)
+            Call SetColumnFormat(ws, "E", DATA_START_ROW, lastRow)
+            Call SetColumnFormat(ws, "F", DATA_START_ROW, lastRow)
+            
+            ' 計算式の挿入
+            Call InsertCalculations(ws, DATA_START_ROW, lastRow)
+            
+    End Select
+
+
+NextSheet:
+Next ws
+End Sub
+
+' ==============================================================================
+' 共通処理: 指定列の書式設定
+' ==============================================================================
+Private Sub SetColumnFormat(ws As Worksheet, colName As String, startRow As Long, endRow As Long)
+With ws.Range(colName & startRow & ":" & colName & endRow)
+.HorizontalAlignment = xlRight  ' 右寄せ
+.VerticalAlignment = xlBottom   ' 下揃え
+.WrapText = False               ' 折り返し解除
+.IndentLevel = 0                ' インデント0
+End With
+End Sub
+
+' ==============================================================================
+' パターンC用: 計算式の挿入ロジック
+' ==============================================================================
+Private Sub InsertCalculations(ws As Worksheet, startRow As Long, endRow As Long)
+Dim i As Long
+Dim currentSumStartRow As Long
+Dim cellValA As String
+Dim cellValD As String
+
+' SUM関数の開始行を初期化
+currentSumStartRow = startRow
+
+For i = startRow To endRow
+    cellValA = ws.Cells(i, "A").Value
+    cellValD = ws.Cells(i, "D").Value
+    
+    ' 条件1: A列に「計」が含まれている場合
+    If InStr(cellValA, "計") > 0 Then
+        ' F列に SUM(開始行 : 現在行の一つ上) を入力
+        ' SUM対象の行が存在する場合のみ数式を入れる
+        If i > currentSumStartRow Then
+            ws.Cells(i, "F").Formula = "=SUM(F" & currentSumStartRow & ":F" & (i - 1) & ")"
+        End If
+        
+        ' 次のSUM区間の開始行を更新（現在の行の次から）
+        currentSumStartRow = i + 1
+        
+    ' 条件2: D列（単位）が空欄ではない場合
+    ElseIf cellValD <> "" Then
+        ' F列 = C列 * E列
+        ws.Cells(i, "F").Formula = "=C" & i & "*E" & i
+        
+    End If
+Next i
+
+
+End Sub
+
+
+
